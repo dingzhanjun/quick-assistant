@@ -1,0 +1,132 @@
+/* Cascade order, lowest to highest: Tailwind theme < Tailwind base (preflight resets) < React Suite < Tailwind components <
+   Tailwind utilities. rsuite must sit ABOVE base (otherwise preflight's `button { background: none }` etc. wipes its styles)
+   and BELOW utilities (so a class like `w-full` or `mt-2` still wins over a rsuite component style).
+   The "no-reset" build keeps rsuite from restyling global elements; Tailwind owns those. */
+@layer theme, base, rsuite, components, utilities;
+@import "rsuite/dist/rsuite-no-reset.min.css" layer(rsuite);
+@import "tailwindcss";
+
+@custom-variant dark (&:is(.dark *));
+
+@theme inline {
+  --color-primary-text: var(--primary-text);
+  --color-success-text: var(--success-text);
+  --color-warning-text: var(--warning-text);
+  --color-destructive-text: var(--destructive-text);
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --font-sans: var(--app-font);
+  --font-mono: var(--app-font-mono);
+  --font-heading: var(--app-font);
+  --color-ring: var(--ring);
+  --color-input: var(--input);
+  --color-border: var(--border);
+  --color-destructive: var(--destructive);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-muted: var(--muted);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-secondary: var(--secondary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-primary: var(--primary);
+  --color-card-foreground: var(--card-foreground);
+  --color-card: var(--card);
+  --radius-sm: calc(var(--radius) * 0.6);
+  --radius-md: calc(var(--radius) * 0.8);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) * 1.4);
+  --radius-2xl: calc(var(--radius) * 1.8);
+  --radius-3xl: calc(var(--radius) * 2.2);
+  --radius-4xl: calc(var(--radius) * 2.6);
+}
+
+:root {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  /* accent colours come from React Suite so Tailwind classes (text-primary, border-primary, ring) match its components */
+  --primary: var(--rs-primary-500);
+  --primary-foreground: #fff;
+  /* accent / status colours for TEXT: the button colours are too light to read on white (AA contrast), so text uses darker
+     shades in light mode and lighter ones in dark mode */
+  --primary-text: var(--rs-primary-800);
+  --success-text: var(--rs-green-800);
+  --warning-text: var(--rs-orange-800);
+  --destructive-text: var(--rs-red-800);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --destructive: var(--rs-red-500);
+  --border: oklch(0.922 0 0);
+  --input: oklch(0.922 0 0);
+  --ring: oklch(0.708 0 0);
+  --radius: 0.625rem;
+}
+
+.dark {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --primary: var(--rs-primary-500);
+  --primary-foreground: #fff;
+  --primary-text: var(--rs-primary-500);
+  --success-text: var(--rs-green-400);
+  --warning-text: var(--rs-orange-400);
+  --destructive-text: var(--rs-red-400);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --destructive: var(--rs-red-500);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 15%);
+  --ring: oklch(0.556 0 0);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  body {
+    @apply bg-background text-foreground;
+  }
+  html {
+    @apply font-sans;
+  }
+}
+
+/* React Suite's default primary / red buttons put white text on a light blue / red: about 3:1, below the 4.5:1 accessibility
+   minimum (WCAG AA). Use darker shades for the button background (these variables are what rsuite's own button CSS reads). */
+@layer components {
+  .rs-btn {
+    --rs-btn-primary-bg: var(--rs-primary-800);
+    --rs-btn-primary-hover-bg: var(--rs-primary-900);
+    --rs-btn-primary-active-bg: var(--rs-primary-900);
+  }
+  .rs-theme-dark .rs-btn {
+    --rs-btn-primary-bg: var(--rs-primary-900);
+    --rs-btn-primary-hover-bg: var(--rs-primary-800);
+    --rs-btn-primary-active-bg: var(--rs-primary-800);
+  }
+  .rs-btn[data-color="red"] {
+    --rs-btn-primary-bg: var(--rs-red-800);
+    --rs-btn-primary-hover-bg: var(--rs-red-900);
+    --rs-btn-primary-active-bg: var(--rs-red-900);
+  }
+}
+
+/* Typography: Roboto (loaded in layout.tsx as --font-roboto), then system fonts. React Suite reads the same stack through its own font variables. */
+:root {
+  --app-font: var(--font-roboto), ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --app-font-mono: var(--font-roboto-mono), ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@layer components {
+  :root,
+  .rs-theme-light,
+  .rs-theme-dark {
+    --rs-font-family-base: var(--app-font);
+    --rs-font-family-monospace: var(--app-font-mono);
+  }
+}

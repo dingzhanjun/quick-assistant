@@ -1,0 +1,275 @@
+name: CI
+on:
+  push:
+    branches: [main, dev] # main -> GitHub environment Prod, dev -> environment Dev
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  web:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17@sha256:2d2b8998d31037bf721cfdf764d76ba74171b4fab3431b7f72c27c56ddbdf9e3
+        env:
+          POSTGRES_USER: quickassistant
+          POSTGRES_PASSWORD: quickassistant
+          POSTGRES_DB: quickassistant
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U quickassistant" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      # Migrations + unit tests + tenant-isolation tests (tests/*.test.ts) against a throwaway Postgres.
+      - run: pnpm --filter web db:migrate
+        env:
+          DATABASE_URL: postgres://quickassistant:quickassistant@localhost:5432/quickassistant
+      - run: pnpm --filter web test
+        env:
+          DATABASE_URL: postgres://quickassistant:quickassistant@localhost:5432/quickassistant
+          BETTER_AUTH_SECRET: ci-test-secret
+          BETTER_AUTH_URL: http://localhost:3000
+          GOOGLE_CLIENT_ID: ci
+          GOOGLE_CLIENT_SECRET: ci
+      - run: pnpm --filter web build
+        env:
+          # Dummy values: the build needs them to exist but never connects or signs anything.
+          DATABASE_URL: postgres://user:pass@localhost:5432/db
+          BETTER_AUTH_SECRET: ci-build-only-secret-not-used-anywhere-real
+          BETTER_AUTH_URL: http://localhost:3000
+          GOOGLE_CLIENT_ID: ci
+          GOOGLE_CLIENT_SECRET: ci
+
+      # Browser tests of the dashboard against the build above (menu, modifiers, settings, orders, staff limits).
+      - run: pnpm --filter web exec playwright install --with-deps chromium
+      - run: pnpm --filter web test:e2e
+        env:
+          DATABASE_URL: postgres://quickassistant:quickassistant@localhost:5432/quickassistant
+          BETTER_AUTH_SECRET: ci-test-secret
+          BETTER_AUTH_URL: http://localhost:3100
+          GOOGLE_CLIENT_ID: ci
+          GOOGLE_CLIENT_SECRET: ci
+          AGENT_API_KEY: ci-e2e-agent-key
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: playwright-report
+          path: |
+            apps/web/playwright-report
+            apps/web/test-results
+          if-no-files-found: ignore
+
+  # Dependency + config vulnerability scan (lockfiles, Dockerfiles, compose). Fails on fixable HIGH/CRITICAL.
+  security:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: aquasecurity/trivy-action@a9c7b0f06e461e9d4b4d1711f154ee024b8d7ab8 # v0.36.0
+        with:
+          scan-type: fs
+          scanners: vuln,misconfig
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+
+  agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/agent
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv sync --frozen
+      - run: uv run python -c "import order_agent.main"
+      - run: uv run python -m pytest -q
+
+  # Kitchen print agent (Go, apps/printer-agent): vet, tests, and a cross-compile check for the Raspberry Pi (64-bit and 32-bit OS)
+  # and x86 Linux. The shipped binaries are NOT built here: apps/web/Dockerfile builds them into the web image (public/printer/), so
+  # the server hosts the agent downloads itself. Bump apps/printer-agent/VERSION when the agent changes; agents update on the
+  # next web deploy.
+  printer-agent:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: apps/printer-agent
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - run: go version && go vet ./... && go test ./...
+      - name: Cross-compile check
+        run: |
+          for t in arm64:arm64: arm:arm:6 amd64:amd64:; do
+            IFS=: read -r name goarch goarm <<< "$t"
+            CGO_ENABLED=0 GOOS=linux GOARCH="$goarch" GOARM="$goarm" go build -trimpath -o /dev/null ./cmd/order-printer
+            echo "built linux/$name"
+          done
+      - name: VERSION is a plain version number
+        run: grep -Eq '^[0-9]+(\.[0-9]+){0,3}$' VERSION
+
+  # Builds each image in its own job (matrix) and pushes it to GHCR on main. Pull requests only build
+  # (no push, no login), which proves the Dockerfiles work. The server pulls these exact images by commit sha.
+  build-image:
+    name: Build ${{ matrix.name }} image
+    needs: [web, agent, printer-agent, security]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    strategy:
+      fail-fast: false
+      # max-parallel: 1   # uncomment to build the images strictly one after another
+      matrix:
+        include:
+          - name: web
+            file: apps/web/Dockerfile
+            context: .
+            target: runner
+            scope: web
+          - name: migrate
+            file: apps/web/Dockerfile
+            context: .
+            target: migrate
+            scope: web # same Dockerfile: share the cache so the shared stages build once
+          - name: agent
+            file: apps/agent/Dockerfile
+            context: apps/agent
+            target: ''
+            scope: agent
+    env:
+      # Images are pushed from main and dev only; pull requests just prove the Dockerfiles build.
+      PUSH: ${{ github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Log in to GitHub Container Registry
+        if: env.PUSH == 'true'
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@c299e40c65443455700f0fdfc63efafe5b349051 # v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository }}/${{ matrix.name }}
+          # The FULL sha: deploy.sh checks out and validates exactly this 40-character value.
+          tags: |
+            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
+            type=raw,value=dev,enable=${{ github.ref == 'refs/heads/dev' }}
+            type=raw,value=${{ github.sha }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build and push
+        uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          target: ${{ matrix.target }}
+          push: ${{ env.PUSH == 'true' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.scope }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.scope }}
+
+  # Decides whether this push changed anything that ships. Docs, markdown, licence and test-only commits build the same
+  # images, so they must not redeploy (and restart) the servers. Add "[deploy]" to a commit message to force a deploy anyway.
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.diff.outputs.code }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Did code change since the previous push?
+        id: diff
+        env:
+          BEFORE: ${{ github.event.before }}
+          MESSAGE: ${{ github.event.head_commit.message }}
+        run: |
+          code=true
+          if [[ "$MESSAGE" == *"[deploy]"* ]]; then
+            reason="commit message contains [deploy]"
+          elif [ -z "$BEFORE" ] || [[ "$BEFORE" =~ ^0+$ ]] || ! git cat-file -e "$BEFORE^{commit}" 2>/dev/null; then
+            reason="no previous commit to compare with (first push, or history was rewritten)"
+          else
+            code=false
+            reason="only docs / tests changed"
+            while IFS= read -r f; do
+              case "$f" in
+                "") ;;
+                *.md|docs/*|LICENSE*|.gitignore) ;;                                   # documentation and repo housekeeping
+                apps/web/tests/*|apps/web/e2e/*|apps/agent/tests/*|apps/agent/evals/*) ;;  # tests are not shipped
+                apps/printer-agent/*_test.go) ;;
+                *) code=true; reason="changed: $f"; break ;;
+              esac
+            done < <(git diff --name-only "$BEFORE" "$GITHUB_SHA")
+          fi
+          echo "code=$code" >> "$GITHUB_OUTPUT"
+          echo "Deploy needed: $code ($reason)" | tee -a "$GITHUB_STEP_SUMMARY"
+
+  # Redeploys the matching server after CI passes: pushes to `main` deploy GitHub environment Prod, pushes to `dev`
+  # deploy environment Dev. Each environment has its OWN secrets and variables (DEPLOY_HOST, DEPLOY_USER, ...; see
+  # DEPLOY.md "Automatic deploys"), so Dev and Prod are different servers. A Prod environment can require approval.
+  deploy:
+    needs: [build-image, changes]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/dev') && needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    environment: ${{ github.ref == 'refs/heads/main' && 'Prod' || 'Dev' }}
+    concurrency:
+      group: deploy-${{ github.ref_name }}
+      cancel-in-progress: false
+    steps:
+      # Without deploy settings this job does nothing (deploy by hand with scripts/deploy.sh, see DEPLOY.md).
+      - name: Check deploy settings
+        id: cfg
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_FINGERPRINT: ${{ secrets.DEPLOY_FINGERPRINT }}
+        run: |
+          if [ -z "$DEPLOY_HOST" ] || [ -z "$DEPLOY_USER" ] || [ -z "$DEPLOY_FINGERPRINT" ] || { [ -z "$DEPLOY_SSH_KEY" ] && [ -z "$DEPLOY_PASSWORD" ]; }; then
+            echo "Deploy secrets are not configured: skipping the deploy job" >> "$GITHUB_STEP_SUMMARY"
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Third-party action (pinned to a commit): it receives the server password/key. `fingerprint` pins the server's
+      # host key so the job cannot be tricked into logging in to an impersonator.
+      - name: Deploy over SSH
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: appleboy/ssh-action@0ff4204d59e8e51228ff73bce53f80d53301dee2 # v1.2.5
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          port: ${{ secrets.DEPLOY_PORT }}
+          username: ${{ secrets.DEPLOY_USER }}
+          password: ${{ secrets.DEPLOY_PASSWORD }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          fingerprint: ${{ secrets.DEPLOY_FINGERPRINT }}
+          # The full commit sha selects which pushed images the server pulls (hex only, so safe to inline).
+          script: ${{ secrets.DEPLOY_PATH }}/scripts/deploy.sh ${{ github.sha }}
+
+      - name: Check public health
+        if: steps.cfg.outputs.enabled == 'true'
+        env:
+          DEPLOY_URL: ${{ secrets.DEPLOY_URL }}
+        run: curl --retry 10 --retry-delay 6 --retry-all-errors -fsS "$DEPLOY_URL/api/health"

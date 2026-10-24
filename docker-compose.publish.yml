@@ -1,0 +1,14 @@
+# Overlay for publishing: build every image for Intel/AMD and ARM servers, so one tag runs on a VPS, a mini PC or a Raspberry Pi 5.
+# (CI builds amd64 only, which covers ordinary servers.)
+#   docker compose -f docker-compose.yml -f docker-compose.publish.yml build --push
+# Needs a multi-platform builder first (once): docker buildx create --use
+services:
+  migrate:
+    build:
+      platforms: [linux/amd64, linux/arm64]
+  web:
+    build:
+      platforms: [linux/amd64, linux/arm64]
+  agent:
+    build:
+      platforms: [linux/amd64, linux/arm64]

@@ -1,0 +1,390 @@
+# Quick Assistant: the whole stack in ONE file. A server needs only this file and a .env next to it:
+#
+#   mkdir quick-assistant && cd quick-assistant       # put docker-compose.yml and .env here (see the README for the .env)
+#   docker compose up -d                              # pulls the images from GHCR, migrates the database, starts everything
+#   docker compose pull && docker compose up -d       # to update later
+#
+# Images: ${IMAGE_PREFIX}/<web|migrate|agent>:${IMAGE_TAG}, default ghcr.io/dingzhanjun/quick-assistant (public, no login).
+# For your own fork set IMAGE_PREFIX=ghcr.io/<you>/<repo> (lowercase) in .env.
+# Exactly one public entry point runs, chosen by COMPOSE_PROFILES in .env:
+#   caddy  -> Caddy serves HTTPS itself (server needs ports 80/443 open to the internet, DNS pointing at it)
+#   tunnel -> cloudflared connects out to Cloudflare; no inbound ports needed
+# Needs Docker Compose v2.23.1 or newer (any current Docker Engine install; check with `docker compose version`).
+#
+# DEVELOPERS: in a clone of the repository, `docker compose build` (or `up -d --build`) builds the images from source.
+# CI (.github/workflows/ci.yml) publishes them to GHCR on every push to main, and scripts/deploy.sh is the optional
+# CI deploy script. By hand, for Intel/AMD and ARM:
+#   echo $GITHUB_TOKEN | docker login ghcr.io -u dingzhanjun    # a token with write:packages
+#   docker buildx create --use       # once; the default builder cannot do multi-platform builds
+#   docker compose -f docker-compose.yml -f docker-compose.publish.yml build --push
+# New GHCR packages start PRIVATE: make web, migrate and agent public once (GitHub > Packages > package settings).
+name: quickassistant
+
+# Docker's default json-file logs grow forever; cap them. Memory limits keep one runaway service from taking
+# the whole server down (tune after the load test, P4.4).
+x-logging: &logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "5"
+
+services:
+  db:
+    image: postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 512m
+    environment:
+      POSTGRES_USER: quickassistant
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      POSTGRES_DB: quickassistant
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U quickassistant"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    # No published ports: only reachable from other containers on this stack's network.
+
+  # Scheduled database backups, no host cron needed. Writes verified dumps to ./backups and keeps the
+  # newest BACKUP_KEEP. Copy them off this server (see DEPLOY.md); a backup on the same disk is not enough.
+  backup:
+    image: postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 256m
+    entrypoint: ["bash", "/backup.sh"]
+    command: ["loop"]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      BACKUP_HOUR: ${BACKUP_HOUR:-3}
+      BACKUP_KEEP: ${BACKUP_KEEP:-14}
+    volumes:
+      - ./backups:/backups
+    configs:
+      - source: backup_sh
+        target: /backup.sh
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # Daily purge of caller phone numbers older than RETENTION_CALLER_DAYS (default 90). Script: `retention_sh` under configs at the bottom.
+  retention:
+    image: postgres:16@sha256:ca0bd484cb98bf4b24eb1010e73fb3fcbd6714d240fbc1a10eea5b7dbecb641d
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 128m
+    entrypoint: ["bash", "/retention.sh"]
+    command: ["loop"]
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      RETENTION_CALLER_DAYS: ${RETENTION_CALLER_DAYS:-90}
+      RETENTION_HOUR: ${RETENTION_HOUR:-4}
+    configs:
+      - source: retention_sh
+        target: /retention.sh
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  migrate:
+    image: ${IMAGE_PREFIX:-ghcr.io/dingzhanjun/quick-assistant}/migrate:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: migrate
+    restart: "no"
+    logging: *logging
+    mem_limit: 512m
+    environment:
+      DATABASE_URL: postgres://quickassistant:${POSTGRES_PASSWORD}@db:5432/quickassistant
+    depends_on:
+      db:
+        condition: service_healthy
+
+  web:
+    image: ${IMAGE_PREFIX:-ghcr.io/dingzhanjun/quick-assistant}/web:${IMAGE_TAG:-latest}
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: runner
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 768m
+    environment:
+      DATABASE_URL: postgres://quickassistant:${POSTGRES_PASSWORD}@db:5432/quickassistant
+      BETTER_AUTH_SECRET: ${BETTER_AUTH_SECRET:?set BETTER_AUTH_SECRET}
+      BETTER_AUTH_URL: https://${DOMAIN:?set DOMAIN}
+      GOOGLE_CLIENT_ID: ${GOOGLE_CLIENT_ID:-}
+      GOOGLE_CLIENT_SECRET: ${GOOGLE_CLIENT_SECRET:-}
+      AGENT_API_KEY: ${AGENT_API_KEY:?set AGENT_API_KEY}
+      PLATFORM_ADMIN_EMAILS: ${PLATFORM_ADMIN_EMAILS:-}
+      PLATFORM_ADMIN_PASSWORD: ${PLATFORM_ADMIN_PASSWORD:-}   # optional: seeds the FIRST admin on a brand-new system (see .env.prod.example)
+      JOB_WORKER: "off"   # sending emails/texts happens in the dedicated `worker` service below, not in the request-serving web process
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      # texting the order link to customers (empty SMS_PROVIDER = off: the phone agent does not offer it)
+      SMS_PROVIDER: ${SMS_PROVIDER:-}
+      SMS_FROM: ${SMS_FROM:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      PLIVO_AUTH_ID: ${PLIVO_AUTH_ID:-}
+      PLIVO_AUTH_TOKEN: ${PLIVO_AUTH_TOKEN:-}
+      # kitchen print agents: the web image serves its own agent files; set BOTH only to host them elsewhere (empty = built-in)
+      PRINT_AGENT_VERSION: ${PRINT_AGENT_VERSION:-}
+      PRINT_AGENT_BASE_URL: ${PRINT_AGENT_BASE_URL:-}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/api/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  # Sends the queued emails and texts (with retries), the "order not acknowledged" reminders and housekeeping. It is a small separate
+  # program (apps/web/src/worker, bundled into the web image as worker.cjs): no Next.js, no pages, only the job loop and a health
+  # endpoint, so a slow provider or a burst of messages never slows the web app and it needs little memory. It gets only the settings
+  # it needs (no auth secret, no agent key). Nothing is published; `/health` fails when due jobs are not being picked up.
+  worker:
+    image: ${IMAGE_PREFIX:-ghcr.io/dingzhanjun/quick-assistant}/web:${IMAGE_TAG:-latest}
+    command: ["node", "apps/web/worker.cjs"]
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 128m # measured about 15 MB idle
+    environment:
+      DATABASE_URL: postgres://quickassistant:${POSTGRES_PASSWORD}@db:5432/quickassistant
+      BETTER_AUTH_URL: https://${DOMAIN:?set DOMAIN}
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      EMAIL_FROM: ${EMAIL_FROM:-}
+      SMS_PROVIDER: ${SMS_PROVIDER:-}
+      SMS_FROM: ${SMS_FROM:-}
+      TWILIO_ACCOUNT_SID: ${TWILIO_ACCOUNT_SID:-}
+      TWILIO_AUTH_TOKEN: ${TWILIO_AUTH_TOKEN:-}
+      PLIVO_AUTH_ID: ${PLIVO_AUTH_ID:-}
+      PLIVO_AUTH_TOKEN: ${PLIVO_AUTH_TOKEN:-}
+      UNACK_ALERT_MINUTES: ${UNACK_ALERT_MINUTES:-5}
+      JOB_TICK_SECONDS: ${JOB_TICK_SECONDS:-2}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 20s
+
+  agent:
+    image: ${IMAGE_PREFIX:-ghcr.io/dingzhanjun/quick-assistant}/agent:${IMAGE_TAG:-latest}
+    build:
+      context: apps/agent
+    restart: unless-stopped
+    # Number of agent containers (each takes up to AGENT_MAX_CALLS calls). Raise it, or `docker compose up -d --scale agent=N`.
+    deploy:
+      replicas: ${AGENT_REPLICAS:-1}
+    # On a deploy/stop the worker stops taking new calls and waits up to AGENT_DRAIN_SECONDS for running ones to finish,
+    # so Docker must not kill it earlier: keep this above AGENT_DRAIN_SECONDS (default 900 s).
+    stop_grace_period: ${AGENT_STOP_GRACE:-16m}
+    logging: *logging
+    mem_limit: ${AGENT_MEM_LIMIT:-1536m}
+    environment:
+      LIVEKIT_URL: ${LIVEKIT_URL:?set LIVEKIT_URL}
+      LIVEKIT_API_KEY: ${LIVEKIT_API_KEY:?set LIVEKIT_API_KEY}
+      LIVEKIT_API_SECRET: ${LIVEKIT_API_SECRET:?set LIVEKIT_API_SECRET}
+      AGENT_NAME: ${AGENT_NAME:-}
+      # Internal Docker network: plain http is fine and avoids a TLS round trip.
+      WEB_API_URL: http://web:3000
+      AGENT_API_KEY: ${AGENT_API_KEY}
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:?set DEEPGRAM_API_KEY}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      DEEPSEEK_API_KEY: ${DEEPSEEK_API_KEY:-}
+      VOICE_MODE: ${VOICE_MODE:-pipeline}
+      MENU_SEARCH_THRESHOLD: ${MENU_SEARCH_THRESHOLD:-40}
+      XAI_API_KEY: ${XAI_API_KEY:-}
+      GROK_VOICE: ${GROK_VOICE:-ara}
+      GROK_MODEL: ${GROK_MODEL:-grok-voice-latest}
+      GROK_SPEED: ${GROK_SPEED:-}
+      # Capacity tuning per container (all optional, see DEPLOY.md "Scaling the voice agent")
+      AGENT_MAX_CALLS: ${AGENT_MAX_CALLS:-}
+      AGENT_LOAD_THRESHOLD: ${AGENT_LOAD_THRESHOLD:-}
+      AGENT_IDLE_PROCESSES: ${AGENT_IDLE_PROCESSES:-}
+      AGENT_JOB_MEMORY_WARN_MB: ${AGENT_JOB_MEMORY_WARN_MB:-}
+      AGENT_JOB_MEMORY_LIMIT_MB: ${AGENT_JOB_MEMORY_LIMIT_MB:-}
+      AGENT_DRAIN_SECONDS: ${AGENT_DRAIN_SECONDS:-900}
+      AGENT_PROMETHEUS_PORT: ${AGENT_PROMETHEUS_PORT:-}
+      CALL_MAX_SECONDS: ${CALL_MAX_SECONDS:-480}
+      CALL_IDLE_PROMPT_SECONDS: ${CALL_IDLE_PROMPT_SECONDS:-20}
+      CALL_IDLE_HANGUP_SECONDS: ${CALL_IDLE_HANGUP_SECONDS:-30}
+    # The LiveKit worker answers HTTP 200 on its health port (8081) while it is registered and healthy.
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/', timeout=3).status == 200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 40s
+    depends_on:
+      web:
+        condition: service_healthy
+
+  caddy:
+    profiles: ["caddy"]
+    image: caddy:2@sha256:685ae3d7c34d9b5f8caeddc5d14051db7bbd88ff1f5a2fa0c16bd8ca328fb7af
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 128m
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      DOMAIN: ${DOMAIN}
+    configs:
+      - source: caddyfile
+        target: /etc/caddy/Caddyfile
+    volumes:
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+
+  cloudflared:
+    profiles: ["tunnel"]
+    image: cloudflare/cloudflared:latest@sha256:a15a3b50b8dabd57ac2090e9484c0247dba9dfa1f0df4d298d4317f9d69eb2d5
+    restart: unless-stopped
+    logging: *logging
+    mem_limit: 128m
+    # Remotely-managed tunnel: the public hostname -> http://web:3000 mapping lives in the
+    # Cloudflare dashboard (see DEPLOY.md). Empty token = cloudflared exits with a clear error.
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${CLOUDFLARE_TUNNEL_TOKEN:-}
+    depends_on:
+      web:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  caddy_data:
+  caddy_config:
+
+# Small files the stack needs, kept inline so this one file is everything a server needs (no clone, no extra folders).
+# "$$" is how compose writes a literal "$".
+configs:
+  caddyfile:
+    content: |
+      # Caddy obtains and renews the HTTPS certificate automatically for {$$DOMAIN}
+      # (needs DNS pointing at this server and ports 80/443 open).
+      {$$DOMAIN} {
+      	encode gzip
+
+      	# Next sets the app headers; Caddy adds HSTS for anything it serves itself and hides the server banner.
+      	header {
+      		Strict-Transport-Security "max-age=63072000; includeSubDomains"
+      		-Server
+      	}
+
+      	# The voice agent calls /api/agent/* over the internal Docker network (http://web:3000),
+      	# so it is never needed from the internet. Block it publicly as a second barrier.
+      	@agentApi path /api/agent/*
+      	respond @agentApi 404
+
+      	# flush_interval -1: send server-sent events (the live orders board) immediately instead of buffering them
+      	reverse_proxy web:3000 {
+      		flush_interval -1
+      	}
+      }
+  backup_sh:
+    content: |
+      #!/usr/bin/env bash
+      # Runs inside the `backup` compose service (postgres image, so pg_dump matches the server version).
+      #   backup.sh loop   daily at BACKUP_HOUR (UTC), forever; this is what the service runs
+      #   backup.sh once   one backup now; used by scripts/backup-db.sh and scripts/deploy.sh
+      set -euo pipefail
+      umask 077   # dumps contain customer data: readable by root only
+      dir=/backups
+      keep="$${BACKUP_KEEP:-14}"
+      hour="$${BACKUP_HOUR:-3}"
+      [[ "$$hour" =~ ^([0-9]|1[0-9]|2[0-3])$$ ]] || { echo "BACKUP_HOUR must be 0-23" >&2; exit 1; }
+      [[ "$$keep" =~ ^[1-9][0-9]*$$ ]] || { echo "BACKUP_KEEP must be a positive integer" >&2; exit 1; }
+
+      backup_once() {
+        mkdir -p "$$dir"
+        local out tmp
+        out="$$dir/quickassistant-$$(date -u +%Y%m%d-%H%M%S).sql.gz"
+        tmp="$$out.partial"
+
+        # A failed dump must never leave something that looks like a backup.
+        if ! { pg_dump -h db -U quickassistant --no-owner quickassistant | gzip > "$$tmp"; }; then
+          rm -f "$$tmp"; echo "pg_dump failed" >&2; return 1
+        fi
+        # pg_dump ends a complete plain-format dump with this footer, so a truncated dump is detected.
+        # (tail reads everything, so no SIGPIPE under pipefail, unlike `grep -q` on the whole stream.)
+        if ! gzip -t "$$tmp" || ! gunzip -c "$$tmp" | tail -n 5 | grep -q "database dump complete"; then
+          rm -f "$$tmp"; echo "dump failed verification" >&2; return 1
+        fi
+
+        mv "$$tmp" "$$out"
+        echo "wrote $$out"
+        # Only prune after a successful new backup.
+        ls -1t "$$dir"/quickassistant-*.sql.gz | tail -n +$$((keep + 1)) | xargs -r rm --
+      }
+
+      case "$${1:-}" in
+        once) backup_once ;;
+        loop)
+          while true; do
+            now=$$(date -u +%s)
+            next=$$(date -u -d "today $$hour:00" +%s)
+            [ "$$next" -gt "$$now" ] || next=$$(date -u -d "tomorrow $$hour:00" +%s)
+            echo "next backup: $$(date -u -d "@$$next" '+%Y-%m-%d %H:%M UTC')"
+            sleep $$((next - now))
+            backup_once || echo "BACKUP FAILED" >&2
+          done ;;
+        *) echo "usage: backup.sh once|loop" >&2; exit 2 ;;
+      esac
+  retention_sh:
+    content: |
+      #!/usr/bin/env bash
+      # Data retention (LAUNCH_PLAN D6). Runs inside the `retention` compose service (postgres image, for psql).
+      #   retention.sh loop   daily at RETENTION_HOUR (UTC), forever; this is what the service runs
+      #   retention.sh once   purge now (also used by the test)
+      # Caller phone numbers are kept RETENTION_CALLER_DAYS (default 90): the call log rows are deleted and the number
+      # (and the mobile number the customer asked us to text the order link to) is removed from old orders. The orders themselves (items, customer name) stay while the restaurant is a customer.
+      set -euo pipefail
+      days="$${RETENTION_CALLER_DAYS:-90}"
+      hour="$${RETENTION_HOUR:-4}"
+      [[ "$$days" =~ ^[1-9][0-9]*$$ ]] || { echo "RETENTION_CALLER_DAYS must be a positive integer" >&2; exit 1; }
+      [[ "$$hour" =~ ^([0-9]|1[0-9]|2[0-3])$$ ]] || { echo "RETENTION_HOUR must be 0-23" >&2; exit 1; }
+      export PGHOST="$${PGHOST:-db}" PGUSER="$${PGUSER:-quickassistant}" PGDATABASE="$${PGDATABASE:-quickassistant}"
+
+      purge_once() {
+        psql -v ON_ERROR_STOP=1 -v days="$$days" -At <<'SQL'
+      with c as (delete from calls where started_at < now() - make_interval(days => :days) returning 1),
+           o as (update orders set caller_number = null, contact_number = null
+                 where (caller_number is not null or contact_number is not null)
+                   and created_at < now() - make_interval(days => :days) returning 1),
+           n as (select (select count(*) from c) as calls, (select count(*) from o) as orders),
+           a as (insert into audit_logs (actor_type, actor_label, action, entity_type, summary, details)
+                 select 'system', 'retention job', 'system.retention_purge', 'retention',
+                        'Purged caller numbers older than ' || :days || ' days: ' || n.calls || ' call rows, ' || n.orders || ' orders',
+                        jsonb_build_object('days', :days, 'callRows', n.calls, 'orders', n.orders)
+                 from n where n.calls + n.orders > 0 returning 1)
+      select 'retention: deleted ' || calls || ' call rows, cleared ' || orders || ' order caller numbers (older than ' || :days || ' days)' from n;
+      SQL
+      }
+
+      case "$${1:-}" in
+        once) purge_once ;;
+        loop)
+          while true; do
+            purge_once || echo "RETENTION PURGE FAILED" >&2
+            now=$$(date -u +%s)
+            next=$$(date -u -d "today $$hour:00" +%s)
+            [ "$$next" -gt "$$now" ] || next=$$(date -u -d "tomorrow $$hour:00" +%s)
+            echo "next purge: $$(date -u -d "@$$next" '+%Y-%m-%d %H:%M UTC')"
+            sleep $$((next - now))
+          done ;;
+        *) echo "usage: retention.sh once|loop" >&2; exit 2 ;;
+      esac

@@ -1,0 +1,49 @@
+name: Ordering evals
+# Simulated phone calls against the real agent prompt + tools + LLM (paid API calls, a few cents per run).
+# Not run on pull requests (no secrets for forks, and it costs money): runs when agent code changes on main or dev,
+# weekly (catches provider/model drift), and on demand.
+on:
+  push:
+    branches: [main, dev]
+    paths: ["apps/agent/src/**", "apps/agent/evals/**"]
+  schedule:
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: Runs per scenario
+        default: "5"
+
+permissions:
+  contents: read
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/agent
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+      # Model under test: openai | deepseek (default: whichever key exists). xAI is deliberately NOT wired into CI
+      # (too costly); run Grok evals by hand with EVAL_AGENT_PROVIDER=grok.
+      EVAL_AGENT_PROVIDER: ${{ vars.EVAL_AGENT_PROVIDER }}
+      # The simulated caller is a text LLM: openai | deepseek (default: whichever key exists).
+      EVAL_CALLER_PROVIDER: ${{ vars.EVAL_CALLER_PROVIDER }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: astral-sh/setup-uv@d4b2f3b6ecc6e67c4457f6d3e41ec42d3d0fcb86 # v5
+      - run: uv sync --frozen
+      - name: Run evals
+        # Exits 1 when the overall pass rate is below EVAL_THRESHOLD (default 0.9).
+        run: |
+          if [ -z "$OPENAI_API_KEY$DEEPSEEK_API_KEY" ]; then echo "No LLM key configured: skipping evals" >> "$GITHUB_STEP_SUMMARY"; exit 0; fi
+          EVAL_VERBOSE=1 uv run python -m evals.run_evals --runs "${{ github.event.inputs.runs || '5' }}"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
+        with:
+          name: eval-results
+          path: apps/agent/evals/last_run.json
+          if-no-files-found: ignore

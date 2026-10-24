@@ -1,0 +1,11 @@
+{
+  "name": "quick-assistant",
+  "private": true,
+  "packageManager": "pnpm@10.33.2",
+  "scripts": {
+    "dev:web": "pnpm --filter web dev",
+    "dev:agent": "cd apps/agent && uv run python -m order_agent.main dev",
+    "db:up": "docker compose -f docker-compose.dev.yml up -d db",
+    "lint": "pnpm --filter web lint"
+  }
+}

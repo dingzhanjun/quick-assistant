@@ -1,0 +1,1 @@
+ALTER TABLE "orders" ADD COLUMN "new_pickup_at" timestamp;

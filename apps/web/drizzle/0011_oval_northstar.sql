@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "phone_numbers_tenant_idx" ON "phone_numbers" USING btree ("tenant_id");

@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Printer setup</title>
+<style>body{font:16px system-ui;max-width:34rem;margin:2rem auto;padding:0 1rem}input,button{font:inherit;padding:.5rem;margin:.25rem 0;width:100%;box-sizing:border-box}button{cursor:pointer}fieldset{margin:1rem 0}.msg{background:#eef;padding:.5rem;border-radius:.25rem}dl{display:grid;grid-template-columns:8rem 1fr;gap:.25rem}</style>
+</head><body>
+<h1>Printer setup</h1>
+{{if .Message}}<p class="msg">{{.Message}}</p>{{end}}
+{{if .Login}}
+  {{if .Locked}}<p>Too many wrong PINs. Locked for 15 minutes; a new setup ticket unlocks it.</p>{{else}}
+  <form method="post" action="/login"><label>PIN from the setup ticket<input name="pin" inputmode="numeric" autocomplete="off" maxlength="6" autofocus></label><button>Sign in</button></form>{{end}}
+{{else}}
+  <dl>
+    <dt>Status</dt><dd>{{if .Status.Paired}}paired: {{.Status.Restaurant}}{{else}}<b>not paired</b>{{end}}</dd>
+    <dt>Server</dt><dd>{{.Status.Server}}</dd>
+    <dt>Version</dt><dd>{{.Status.Version}}</dd>
+    <dt>Host</dt><dd>{{.Status.Hostname}}</dd>
+    <dt>IP</dt><dd>{{.Status.IP}}</dd>
+    <dt>Printers</dt><dd>{{range .Status.Printers}}{{.}} {{else}}none found{{end}}</dd>
+  </dl>
+  <fieldset><legend>Pair with the restaurant account</legend>
+    <form method="post" action="/pair"><label>Server address<input name="server" value="{{.Status.Server}}" placeholder="https://orders.example.com"></label>
+    <label>Pairing code (Settings &rarr; Kitchen printing)<input name="code" autocomplete="off" placeholder="ABCD-EFGH"></label><button>Pair</button></form></fieldset>
+  <fieldset><legend>Wi-Fi</legend>
+    <form method="post" action="/wifi"><label>Network name<input name="ssid" autocomplete="off"></label><label>Password<input name="password" type="password" autocomplete="off"></label><button>Join</button></form>
+    <small>Using an Ethernet cable needs no setup.</small></fieldset>
+  <form method="post" action="/test"><button>Print a test ticket</button></form>
+{{end}}
+</body></html>
