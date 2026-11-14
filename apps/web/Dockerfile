@@ -4,7 +4,7 @@
 # sha256 files and a VERSION file. They end up in the web app's public/printer/, so the server itself hosts the agent downloads
 # (https://<your domain>/printer/order-printer-linux-arm64): no separate release, works for a private repository, and a new agent
 # version reaches the Pis with the next web deploy. Bump apps/printer-agent/VERSION when the agent changes.
-FROM golang:1.23-bookworm@sha256:167053a2bb901972bf2c1611f8f52c44d5fe7e762e5cab213708d82c421614db AS agent
+FROM golang:1.27-bookworm@sha256:4fa7c968ba93f1635670522dbb01a2c78150443e1385746924566079f36570ea AS agent
 WORKDIR /src
 COPY apps/printer-agent/ ./
 RUN set -eu; V="$(tr -d ' \n' < VERSION)"; mkdir -p /out; \
