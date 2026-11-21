@@ -11,7 +11,7 @@ RUN set -eu; V="$(tr -d ' \n' < VERSION)"; mkdir -p /out; \
     build() { CGO_ENABLED=0 GOOS=linux GOARCH="$2" GOARM="$3" go build -trimpath -ldflags "-s -w -X main.version=$V" -o "/out/order-printer-linux-$1" ./cmd/order-printer; \
               (cd /out && sha256sum "order-printer-linux-$1" > "order-printer-linux-$1.sha256"); }; \
     build arm64 arm64 ""; build arm arm 6; build amd64 amd64 ""; echo "$V" > /out/VERSION
-FROM node:22-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS base
+FROM node:26-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS base
 RUN corepack enable
 WORKDIR /repo
 
@@ -36,7 +36,7 @@ FROM build AS migrate
 WORKDIR /repo/apps/web
 CMD ["pnpm", "db:migrate"]
 
-FROM node:22-slim@sha256:c3de60bf2f9dd0ac6370e6117950ff62d6e339527e7472301c9c78a017978392 AS runner
+FROM node:26-slim@sha256:e6bedef217677b276c591795e169840edd9096dbf13f29df8ef8d1856b8820bc AS runner
 ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
 WORKDIR /repo
 COPY --from=build --chown=node:node /repo/apps/web/.next/standalone ./
